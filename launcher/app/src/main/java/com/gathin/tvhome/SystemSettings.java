@@ -64,6 +64,18 @@ final class SystemSettings {
         return context.getPackageManager().resolveActivity(info, PackageManager.MATCH_DEFAULT_ONLY) != null ? info : null;
     }
 
+    /** The system uninstall dialog for pkg, or null for a system app or where no installer handles it. */
+    static Intent uninstall(Context context, String pkg) {
+        PackageManager pm = context.getPackageManager();
+        try {
+            if ((pm.getApplicationInfo(pkg, 0).flags & android.content.pm.ApplicationInfo.FLAG_SYSTEM) != 0) return null;
+        } catch (PackageManager.NameNotFoundException e) {
+            return null;
+        }
+        Intent remove = new Intent(Intent.ACTION_DELETE, Uri.parse("package:" + pkg));
+        return pm.resolveActivity(remove, PackageManager.MATCH_DEFAULT_ONLY) != null ? remove : null;
+    }
+
     /**
      * The TV's display or picture settings. On Xiaomi sets, the AOSP DISPLAY_SETTINGS action resolves to
      * an empty stub in DroidTvSettings; prefer Xiaomi's own PictureActivity where installed.
