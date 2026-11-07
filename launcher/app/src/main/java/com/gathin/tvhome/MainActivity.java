@@ -11,6 +11,7 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.IntentFilter;
+import android.os.UserManager;
 import android.content.pm.PackageManager;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.ResolveInfo;
@@ -282,6 +283,9 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
     private long openOnStartWaitMs;
     /** open_on_start_on_wake: wakeReceiver is registered for this activity's life. */
     private boolean openOnStartOnWake;
+    /** Started before the first unlock: Home stays black until ACTION_USER_UNLOCKED, then recreates. */
+    private boolean lockedBoot;
+    private BroadcastReceiver lockedBootReceiver;
     private volatile Intent startPending;
     private long startDeadline;
     /** Opens the boot's app once the network is validated (networkCallback posts this) or the wait is over. */
@@ -455,6 +459,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        if (waitForUnlock()) return;
         setContentView(R.layout.activity_main);
         density = getResources().getDisplayMetrics().density;
         // config.xml, overlaid by config.json from a pushed theme (see Config and tools/theme.sh).
@@ -1049,6 +1054,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
     @Override
     protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
+        if (lockedBoot) return;
         if (openLauncherSettingsIfAsked(intent)) return;
         if (openLibraryIfAsked(intent)) return;
         if (openInputsIfAsked(intent)) return;
@@ -1069,6 +1075,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
     @Override
     protected void onStart() {
         super.onStart();
+        if (lockedBoot) return;
         stopped = false;
         started = true;
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -1084,6 +1091,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
     @Override
     protected void onResume() {
         super.onResume();
+        if (lockedBoot) return;
         resumed = true;
         // A festival that started or ended while Home was in the background: rebuild with or without it.
         if (festive != festival.active(LocalDate.now())) {
@@ -1145,6 +1153,40 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         }
     }
 
+    /**
+     * The activity is directBootAware so boot resolves Home to it while the user is still locked; Config and
+     * the settings live in credential-protected storage, so until the unlock nothing is read or shown.
+     */
+    private boolean waitForUnlock() {
+        UserManager users = getSystemService(UserManager.class);
+        if (users.isUserUnlocked()) return false;
+        lockedBoot = true;
+        lockedBootReceiver = new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context context, Intent intent) {
+                onUserUnlocked();
+            }
+        };
+        registerReceiver(lockedBootReceiver, new IntentFilter(Intent.ACTION_USER_UNLOCKED));
+        if (users.isUserUnlocked()) onUserUnlocked();
+        return true;
+    }
+
+    private void stopWaitingForUnlock() {
+        if (lockedBootReceiver == null) return;
+        try {
+            unregisterReceiver(lockedBootReceiver);
+        } catch (RuntimeException ignored) {
+        }
+        lockedBootReceiver = null;
+    }
+
+    private void onUserUnlocked() {
+        if (lockedBootReceiver == null) return;
+        stopWaitingForUnlock();
+        recreate();
+    }
+
     /** Launcher settings' change count (Config.SETTINGS_REVISION_KEY); onResume rebuilds Home when it moved. */
     private long settingsRevision() {
         return getSharedPreferences(Config.SETTINGS_NAME, MODE_PRIVATE).getLong(Config.SETTINGS_REVISION_KEY, 0);
@@ -1157,6 +1199,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
+        if (lockedBoot) return;
         if (requestCode == LAUNCHER_SETTINGS_REQUEST && resultCode == RESULT_OK
                 && data != null && data.getBooleanExtra(LauncherSettingsActivity.EXTRA_REORDER, false)) {
             getIntent().putExtra(LauncherSettingsActivity.EXTRA_REORDER, true);
@@ -1289,6 +1332,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
     @Override
     public void onUserInteraction() {
         super.onUserInteraction();
+        if (lockedBoot) return;
         restartIdleClock();
     }
 
@@ -1300,6 +1344,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
     @Override
     protected void onPause() {
         super.onPause();
+        if (lockedBoot) return;
         resumed = false;
         // No UP reaches a paused Home, so a vendor-key hold it saw go down would still open its app later.
         // Only Home's own share is dropped: a key service that saw the same DOWN keeps its hold.
@@ -1329,6 +1374,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
     @Override
     protected void onStop() {
         super.onStop();
+        if (lockedBoot) return;
         started = false;
         unregisterReceiver(timeReceiver);
         clockRefresh.stop();
@@ -1345,6 +1391,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
     @Override
     public void onTrimMemory(int level) {
         super.onTrimMemory(level);
+        if (lockedBoot) return;
         // RUNNING_LOW and CRITICAL also arrive while Home is visible when an accessibility service keeps the
         // process in the foreground; never blank the screen the owner is looking at.
         if (!MemoryTrimPolicy.shouldRelease(level, started)) return;
@@ -1362,6 +1409,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
     @Override
     public void onWindowFocusChanged(boolean hasFocus) {
         super.onWindowFocusChanged(hasFocus);
+        if (lockedBoot) return;
         if (hasFocus) {
             startPendingSettingsReorder();
             if (libraryFocusPending && appLibrary == null) focusLibrary();
@@ -1374,6 +1422,10 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
     @Override
     protected void onDestroy() {
         super.onDestroy();
+        if (lockedBoot) {
+            stopWaitingForUnlock();
+            return;
+        }
         RemoteKeys.release(this);
         cancelHoldOk();
         if (gameDay != null) gameDay.shutdown();
@@ -1421,6 +1473,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
      */
     @Override
     public boolean dispatchKeyEvent(KeyEvent event) {
+        if (lockedBoot) return super.dispatchKeyEvent(event);
         if (homeIgnoreChannelKeys && RemoteKeys.isChannelKey(event.getKeyCode())) return true;
         // Vendor keys (TCL Netflix button, 4062) never reach the key services, only the focused window, so their
         // "hold:" entries run here too or nowhere. Only while resumed: onPause releases Home's holds, and a DOWN
@@ -1757,6 +1810,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
     @Override
     @SuppressWarnings("deprecation")
     public void onBackPressed() {
+        if (lockedBoot) return;
         // Home screen: Back goes nowhere, unless back_opens_clock is on.
         if (backOpensClock) startActivity(new Intent(this, ClockActivity.class));
     }
